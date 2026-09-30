@@ -73,6 +73,24 @@ async def accept_cookies(page):
             continue
 
 
+async def dismiss_signin_popup(page):
+    """Ferme la fenêtre 'Connectez-vous pour profiter pleinement de Google Maps'."""
+    candidates = [
+        page.get_by_role("button", name="Ignorer"),
+        page.get_by_text("Ignorer", exact=True),
+        page.get_by_role("button", name="Not now"),
+    ]
+    for loc in candidates:
+        try:
+            btn = loc.first
+            if await btn.is_visible(timeout=1500):
+                await btn.click()
+                await pause(0.5, 1)
+                return
+        except Exception:
+            continue
+
+
 def load_addresses(path):
     with open(path, newline="", encoding="utf-8-sig") as f:
         rows = list(csv.DictReader(f, delimiter=";"))
@@ -111,11 +129,15 @@ async def find_place(page, address):
     url = f"https://www.google.com/maps/search/{quote(query)}?hl=fr"
     await page.goto(url, wait_until="domcontentloaded")
     await accept_cookies(page)
+    await dismiss_signin_popup(page)
 
     try:
         await page.wait_for_selector(f"{SEL_PLACE_TITLE}, {SEL_RESULT_LINK}", timeout=15000)
     except Exception:
         return False
+
+    # La popup peut aussi apparaître après le chargement
+    await dismiss_signin_popup(page)
 
     # Si Maps affiche une liste de résultats, on clique sur le premier
     if not await page.locator(SEL_PLACE_TITLE).count():
@@ -154,6 +176,7 @@ async def get_place_info(page):
 
 
 async def open_reviews_tab(page):
+    await dismiss_signin_popup(page)
     for sel in [
         'button[role="tab"]:has-text("Avis")',
         'button[aria-label*="Avis"]',
@@ -186,6 +209,7 @@ async def scroll_reviews(page, max_reviews):
     pane = page.locator(SEL_SCROLL_PANE).first
     last, stall = 0, 0
     while stall < MAX_STALL:
+        await dismiss_signin_popup(page)
         count = await page.locator(SEL_REVIEW_CARD).count()
         if max_reviews and count >= max_reviews:
             break
