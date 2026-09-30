@@ -5,6 +5,7 @@ Entrée  : agences.csv  (séparateur ';', colonne obligatoire 'adresse',
           colonnes optionnelles 'id' et 'agence')
 Sorties : avis_agences.jsonl (1 ligne par agence, reprise possible)
           avis_agences.csv   (1 ligne par avis, à plat, avec coordonnées GPS)
+          debug_<id>.png     (screenshot de chaque fiche après le scroll)
 
 Installation :
     pip install playwright
@@ -12,6 +13,9 @@ Installation :
 
 Lancement :
     python scrape_avis_sg.py
+
+NB : supprime avis_agences.jsonl avant de relancer si tu veux retraiter
+les agences déjà scrapées.
 """
 
 import asyncio
@@ -37,14 +41,32 @@ MAX_REVIEWS = 200          # max d'avis par agence (None = tout)
 HEADLESS = False           # False conseillé : moins de blocages, debug plus simple
 DELAY = (1.5, 3.5)         # pause aléatoire entre actions (secondes)
 BETWEEN_PLACES = (4, 9)    # pause entre deux agences
-MAX_STALL = 4              # nb de scrolls sans nouvel avis avant d'arrêter
+MAX_STALL = 6              # nb de scrolls sans nouvel avis avant d'arrêter
 
 # Sélecteurs Google Maps (changent de temps en temps : à ajuster si besoin)
 SEL_PLACE_TITLE = "h1.DUwDvf"
 SEL_RESULT_LINK = "a.hfpxzc"
 SEL_REVIEW_CARD = "div.jftiEf"
-SEL_SCROLL_PANE = "div.m6QErb.DxyBCb.kA9KIf.dS8AEf"
 SEL_MORE_BTN = "button.w8nwRe"
+
+# Trouve le conteneur scrollable à partir d'une carte d'avis et le fait défiler
+# (évite de dépendre des noms de classes du panneau)
+FIND_AND_SCROLL_JS = """
+() => {
+  const card = document.querySelector('div.jftiEf');
+  if (!card) return false;
+  let el = card.parentElement;
+  while (el && el !== document.body) {
+    const s = getComputedStyle(el);
+    if ((s.overflowY === 'auto' || s.overflowY === 'scroll') && el.scrollHeight > el.clientHeight) {
+      el.scrollTo(0, el.scrollHeight);
+      return true;
+    }
+    el = el.parentElement;
+  }
+  return false;
+}
+"""
 
 
 # --------------------------------------------------------------------------- #
@@ -186,6 +208,11 @@ async def open_reviews_tab(page):
             btn = page.locator(sel).first
             if await btn.is_visible(timeout=3000):
                 await btn.click()
+                # Vérifie que l'onglet Avis est réellement sélectionné
+                await page.wait_for_selector(
+                    'button[role="tab"][aria-selected="true"]:has-text("Avis")',
+                    timeout=10000,
+                )
                 await page.wait_for_selector(SEL_REVIEW_CARD, timeout=10000)
                 await pause()
                 return True
@@ -206,7 +233,6 @@ async def sort_by_newest(page):
 
 async def scroll_reviews(page, max_reviews):
     """Fait défiler le panneau d'avis jusqu'à épuisement ou limite atteinte."""
-    pane = page.locator(SEL_SCROLL_PANE).first
     last, stall = 0, 0
     while stall < MAX_STALL:
         await dismiss_signin_popup(page)
@@ -215,8 +241,10 @@ async def scroll_reviews(page, max_reviews):
             break
         stall = stall + 1 if count == last else 0
         last = count
-        await pane.evaluate("el => el.scrollBy(0, el.scrollHeight)")
-        await pause(1.0, 2.0)
+        scrolled = await page.evaluate(FIND_AND_SCROLL_JS)
+        if not scrolled:
+            await page.mouse.wheel(0, 3000)  # repli
+        await pause(2.0, 3.0)
 
 
 async def expand_and_extract(page):
@@ -267,6 +295,7 @@ async def scrape_agency(context, row):
 
         await sort_by_newest(page)
         await scroll_reviews(page, MAX_REVIEWS)
+        await page.screenshot(path=f"debug_{row['id']}.png")
         reviews = await expand_and_extract(page)
 
         # Dédoublonnage + limite
@@ -347,7 +376,7 @@ async def main():
         for i, row in enumerate(todo, 1):
             print(f"[{i}/{len(todo)}] {row['adresse']}")
             res = await scrape_agency(context, row)
-            print(f"    -> {res['status']} | {len(res['reviews'])} avis")
+            print(f"    -> {res['status']} | {len(res['reviews'])} avis | {res['place'].get('name')}")
             with open(OUTPUT_JSONL, "a", encoding="utf-8") as f:
                 f.write(json.dumps(res, ensure_ascii=False) + "\n")
             await pause(*BETWEEN_PLACES)
