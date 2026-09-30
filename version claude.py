@@ -185,7 +185,7 @@ async def get_place_info(page):
         }"""
     )
     norm = lambda s: s.lower().replace("é", "e").replace("è", "e")
-    info["is_bank_match"] = "societe generale" in norm(info["name"])
+    info["is_bank_match"] = bool(re.search(r"\b(societe generale|sg)\b", norm(info["name"])))
 
     # L'URL met parfois un instant à se mettre à jour avec les coordonnées
     for _ in range(5):
@@ -222,13 +222,26 @@ async def open_reviews_tab(page):
 
 
 async def sort_by_newest(page):
-    try:
-        await page.locator('button[aria-label*="Trier"], button[data-value="Trier"]').first.click(timeout=4000)
-        await pause(0.8, 1.5)
-        await page.locator('div[role="menuitemradio"]:has-text("récents")').first.click(timeout=4000)
-        await pause()
-    except Exception:
-        pass  # tri optionnel
+    """Trie les avis par 'Les plus récents'. Renvoie True si le tri a été appliqué."""
+    await dismiss_signin_popup(page)
+
+    sort_buttons = [
+        page.get_by_role("button", name=re.compile(r"trier|sort", re.I)),
+        page.locator('button[aria-label*="Trier"], button[data-value="Trier"], button[data-value="Sort"]'),
+    ]
+    for sort_btn in sort_buttons:
+        try:
+            await sort_btn.first.click(timeout=5000)
+            await pause(0.8, 1.5)
+            option = page.get_by_role("menuitemradio", name=re.compile(r"récent|newest", re.I)).first
+            await option.click(timeout=5000)
+            await pause(2.0, 3.0)  # laisse la liste se recharger
+            return True
+        except Exception:
+            continue
+
+    print("    ! tri par 'plus récents' impossible (bouton ou option introuvable)")
+    return False
 
 
 async def scroll_reviews(page, max_reviews):
@@ -244,7 +257,19 @@ async def scroll_reviews(page, max_reviews):
         scrolled = await page.evaluate(FIND_AND_SCROLL_JS)
         if not scrolled:
             await page.mouse.wheel(0, 3000)  # repli
-        await pause(2.0, 3.0)
+        await pause(1.0, 2.0)
+
+        # En affichage limité, Maps s'arrête à 5 avis et propose "Voir plus d'avis (N)"
+        try:
+            more = page.get_by_text(re.compile(r"Voir plus d.avis", re.I)).first
+            if await more.is_visible(timeout=800):
+                await more.scroll_into_view_if_needed()
+                await more.click()
+                await pause(2.0, 3.0)
+                await dismiss_signin_popup(page)
+        except Exception:
+            pass
+        await pause(1.0, 2.0)
 
 
 async def expand_and_extract(page):
