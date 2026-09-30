@@ -1,9 +1,10 @@
 """
 Scraper d'avis Google Maps pour une liste d'agences Société Générale.
 
-Entrée  : agences.csv  (colonne obligatoire 'adresse', colonne optionnelle 'id')
+Entrée  : agences.csv  (séparateur ';', colonne obligatoire 'adresse',
+          colonnes optionnelles 'id' et 'agence')
 Sorties : avis_agences.jsonl (1 ligne par agence, reprise possible)
-          avis_agences.csv   (1 ligne par avis, à plat)
+          avis_agences.csv   (1 ligne par avis, à plat, avec coordonnées GPS)
 
 Installation :
     pip install playwright
@@ -17,6 +18,7 @@ import asyncio
 import csv
 import json
 import random
+import re
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import quote
@@ -92,6 +94,14 @@ def already_done(path):
     return done
 
 
+def extract_gps(url):
+    """Extrait (lat, lng) de l'URL d'une fiche Google Maps."""
+    m = re.search(r"!3d(-?\d+\.\d+)!4d(-?\d+\.\d+)", url)
+    if not m:
+        m = re.search(r"@(-?\d+\.\d+),(-?\d+\.\d+)", url)  # repli : centre de la carte
+    return (float(m.group(1)), float(m.group(2))) if m else (None, None)
+
+
 # --------------------------------------------------------------------------- #
 # Étapes de scraping
 # --------------------------------------------------------------------------- #
@@ -127,12 +137,19 @@ async def get_place_info(page):
                 address: (addrBtn?.getAttribute('aria-label') || '').replace(/^Adresse\\s*:\\s*/i, ''),
                 rating: ratingBlock?.querySelector('span[aria-hidden="true"]')?.innerText || '',
                 total_reviews: (countEl?.getAttribute('aria-label') || '').replace(/\\D/g, ''),
-                url: location.href,
             };
         }"""
     )
     norm = lambda s: s.lower().replace("é", "e").replace("è", "e")
     info["is_bank_match"] = "societe generale" in norm(info["name"])
+
+    # L'URL met parfois un instant à se mettre à jour avec les coordonnées
+    for _ in range(5):
+        if "!3d" in page.url:
+            break
+        await asyncio.sleep(0.5)
+    info["url"] = page.url
+    info["lat"], info["lng"] = extract_gps(page.url)
     return info
 
 
@@ -252,13 +269,13 @@ async def scrape_agency(context, row):
 def export_flat_csv(jsonl_path, csv_path):
     cols = [
         "agence_id", "adresse_input", "status", "place_name", "place_address",
-        "place_rating", "place_total_reviews", "place_url",
+        "place_rating", "place_total_reviews", "place_url", "lat", "lng",
         "review_id", "author", "author_info", "rating", "date", "text",
         "owner_response", "owner_response_date", "scraped_at",
     ]
     with open(jsonl_path, encoding="utf-8") as fin, \
          open(csv_path, "w", newline="", encoding="utf-8-sig") as fout:
-        w = csv.DictWriter(fout, fieldnames=cols)
+        w = csv.DictWriter(fout, fieldnames=cols, delimiter=";")
         w.writeheader()
         for line in fin:
             a = json.loads(line)
@@ -268,6 +285,7 @@ def export_flat_csv(jsonl_path, csv_path):
                 "status": a["status"], "place_name": p.get("name"),
                 "place_address": p.get("address"), "place_rating": p.get("rating"),
                 "place_total_reviews": p.get("total_reviews"), "place_url": p.get("url"),
+                "lat": p.get("lat"), "lng": p.get("lng"),
                 "scraped_at": a["scraped_at"],
             }
             if not a["reviews"]:
