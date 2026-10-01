@@ -5,14 +5,22 @@ Entrée  : agences.csv  (séparateur ';', colonne obligatoire 'adresse',
           colonnes optionnelles 'id' et 'agence')
 Sorties : avis_agences.jsonl (1 ligne par agence, reprise possible)
           avis_agences.csv   (1 ligne par avis, à plat, avec coordonnées GPS)
-          debug_<id>.png     (screenshot de chaque fiche après le scroll)
+        #   debug_<id>.png     (screenshot de chaque fiche après le scroll)
 
 Installation :
     pip install playwright
     playwright install chromium
 
 Lancement :
-    python scrape_avis_sg.py
+    Étape 1 : lancer Chrome avec un profil dédié
+        Ferme d'abord cette fenêtre si elle est déjà ouverte, puis lance dans l'invite de commandes Windows :
+        "C:\Program Files\Google\Chrome\Application\chrome.exe" --remote-debugging-port=9221 --user-data-dir="C:\chrome-scraping-profile1"
+
+    Étape 2 : se connecter
+        Dans cette fenêtre, connecte-toi à Google, ouvre google.com/maps et accepte les cookies. Laisse la fenêtre ouverte. Le profil est conservé dans C:\chrome-scraping-profile, donc tu ne le feras qu'une fois.
+
+    Étape 3 : lancer le script
+        python scrape_avis_sg.py
 
 NB : supprime avis_agences.jsonl avant de relancer si tu veux retraiter
 les agences déjà scrapées.
@@ -23,6 +31,7 @@ import csv
 import json
 import random
 import re
+import sys
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import quote
@@ -32,17 +41,25 @@ from playwright.async_api import async_playwright
 # --------------------------------------------------------------------------- #
 # Configuration
 # --------------------------------------------------------------------------- #
-INPUT_CSV = "agences.csv"
-OUTPUT_JSONL = "avis_agences.jsonl"
-OUTPUT_CSV = "avis_agences.csv"
-
 BANK_NAME = "Société Générale"
-MAX_REVIEWS = 200          # max d'avis par agence (None = tout)
+MAX_REVIEWS = None          # max d'avis par agence (None = tout)
 HEADLESS = False           # False conseillé : moins de blocages, debug plus simple
+
+# Utiliser un Chrome déjà ouvert et connecté à Google (lancé avec --remote-debugging-port)
+USE_CHROME_CDP = True
+if len(sys.argv) != 5:
+    print("Usage : python scrape_avis_sg.py <port> <input_csv> <output_jsonl> <output_csv>")
+    print("Exemple : python scrape_avis_sg.py 9221 agences1.csv avis_agences1.jsonl avis_agences1.csv")
+    sys.exit(1)
+
+CDP_PORT = sys.argv[1]
+CDP_URL = f"http://localhost:{CDP_PORT}"
 DELAY = (1.5, 3.5)         # pause aléatoire entre actions (secondes)
 BETWEEN_PLACES = (4, 9)    # pause entre deux agences
 MAX_STALL = 6              # nb de scrolls sans nouvel avis avant d'arrêter
-
+INPUT_CSV = sys.argv[2]
+OUTPUT_JSONL = sys.argv[3]
+OUTPUT_CSV = sys.argv[4]
 # Sélecteurs Google Maps (changent de temps en temps : à ajuster si besoin)
 SEL_PLACE_TITLE = "h1.DUwDvf"
 SEL_RESULT_LINK = "a.hfpxzc"
@@ -197,27 +214,39 @@ async def get_place_info(page):
     return info
 
 
-async def open_reviews_tab(page):
-    await dismiss_signin_popup(page)
-    for sel in [
-        'button[role="tab"]:has-text("Avis")',
-        'button[aria-label*="Avis"]',
-        'div.F7nice button',
-    ]:
+async def open_reviews_tab(page, retries=2):
+    """Ouvre l'onglet Avis. Réessaie (avec rechargement de la fiche) en cas d'échec."""
+    for attempt in range(retries + 1):
+        await dismiss_signin_popup(page)
+
+        # Attend que la barre d'onglets (Présentation / Avis / À propos) soit affichée
         try:
-            btn = page.locator(sel).first
-            if await btn.is_visible(timeout=3000):
-                await btn.click()
-                # Vérifie que l'onglet Avis est réellement sélectionné
-                await page.wait_for_selector(
-                    'button[role="tab"][aria-selected="true"]:has-text("Avis")',
-                    timeout=10000,
-                )
-                await page.wait_for_selector(SEL_REVIEW_CARD, timeout=10000)
-                await pause()
-                return True
+            await page.wait_for_selector('button[role="tab"]', timeout=8000)
         except Exception:
-            continue
+            pass
+
+        for sel in [
+            'button[role="tab"]:has-text("Avis")',
+            'button[role="tab"][aria-label*="Avis"]',
+            'button[aria-label*="avis"]',
+            'div.F7nice button',
+            'span[aria-label*="avis"]',
+            'span[role="img"][aria-label*="toile"]',  # clic sur les étoiles de la note
+        ]:
+            try:
+                btn = page.locator(sel).first
+                if await btn.is_visible(timeout=3000):
+                    await btn.click()
+                    await page.wait_for_selector(SEL_REVIEW_CARD, timeout=10000)
+                    await pause()
+                    return True
+            except Exception:
+                continue
+
+        if attempt < retries:
+            print(f"    ! onglet Avis introuvable, nouvelle tentative ({attempt + 1}/{retries})")
+            await page.reload(wait_until="domcontentloaded")
+            await pause(2.0, 3.0)
     return False
 
 
@@ -316,11 +345,12 @@ async def scrape_agency(context, row):
 
         if not await open_reviews_tab(page):
             result["status"] = "no_reviews_tab"
+            # await page.screenshot(path=f"debug_{row['id']}_no_reviews_tab.png")
             return result
 
         await sort_by_newest(page)
         await scroll_reviews(page, MAX_REVIEWS)
-        await page.screenshot(path=f"debug_{row['id']}.png")
+        # await page.screenshot(path=f"debug_{row['id']}.png")
         reviews = await expand_and_extract(page)
 
         # Dédoublonnage + limite
@@ -384,29 +414,43 @@ async def main():
     print(f"{len(rows)} agences au total, {len(todo)} à traiter.")
 
     async with async_playwright() as pw:
-        browser = await pw.chromium.launch(
-            headless=HEADLESS,
-            args=["--disable-blink-features=AutomationControlled"],
-        )
-        context = await browser.new_context(
-            locale="fr-FR",
-            timezone_id="Europe/Paris",
-            viewport={"width": 1366, "height": 850},
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
-            ),
-        )
+        if USE_CHROME_CDP:
+            # Se branche sur ton Chrome déjà ouvert et connecté à Google
+            browser = await pw.chromium.connect_over_cdp(CDP_URL)
+            context = browser.contexts[0]
+        else:
+            browser = await pw.chromium.launch(
+                headless=HEADLESS,
+                args=["--disable-blink-features=AutomationControlled"],
+            )
+            context = await browser.new_context(
+                locale="fr-FR",
+                timezone_id="Europe/Paris",
+                viewport={"width": 1366, "height": 850},
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                    "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+                ),
+            )
 
         for i, row in enumerate(todo, 1):
             print(f"[{i}/{len(todo)}] {row['adresse']}")
-            res = await scrape_agency(context, row)
-            print(f"    -> {res['status']} | {len(res['reviews'])} avis | {res['place'].get('name')}")
+            res = None
+            for attempt in range(1, 4):  # jusqu'à 3 essais si la fiche se charge sans onglet Avis
+                res = await scrape_agency(context, row)
+                if res["status"] != "no_reviews_tab":
+                    break
+                print(f"    ! essai {attempt}/3 sans onglet Avis, on réessaie")
+                await pause(6, 12)
+            p = res["place"]
+            print(f"    -> {res['status']} | {len(res['reviews'])} avis | {p.get('name')} | "
+                  f"{p.get('address')} | {p.get('total_reviews')} avis sur la fiche")
             with open(OUTPUT_JSONL, "a", encoding="utf-8") as f:
                 f.write(json.dumps(res, ensure_ascii=False) + "\n")
             await pause(*BETWEEN_PLACES)
 
-        await browser.close()
+        if not USE_CHROME_CDP:
+            await browser.close()  # en mode CDP, on laisse ton Chrome ouvert
 
     export_flat_csv(OUTPUT_JSONL, OUTPUT_CSV)
     print(f"Terminé. Export : {OUTPUT_CSV}")
